@@ -1,7 +1,9 @@
 @echo off
+chcp 65001 >nul
 REM ====================================================
 REM   AutoClicker Console Launcher (Windows)
-REM   English-only messages to avoid encoding issues.
+REM   chcp 65001 + main.py stdout UTF-8 reconfigure
+REM   so Korean/Unicode characters display correctly.
 REM ====================================================
 
 cd /d "%~dp0"

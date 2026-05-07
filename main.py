@@ -14,6 +14,14 @@
 import sys
 import time
 
+# Force UTF-8 console output on Windows.
+# cmd default cp949 (Korean) cannot encode em-dash, smart quotes, etc.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 try:
     import pyautogui
 except ImportError:
