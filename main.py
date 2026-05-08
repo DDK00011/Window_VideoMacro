@@ -22,6 +22,31 @@ try:
 except Exception:
     pass
 
+
+def _set_dpi_awareness() -> None:
+    """Windows DPI awareness 활성화 — 다중 모니터/배율 다를 때 좌표 정확성."""
+    if not sys.platform.startswith("win"):
+        return
+    import ctypes
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_set_dpi_awareness()
+
+
 try:
     import pyautogui
 except ImportError:

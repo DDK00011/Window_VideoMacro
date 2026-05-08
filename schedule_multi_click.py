@@ -4,6 +4,8 @@
   - 1시간 45분 뒤
   - 지정된 9개 좌표를 좌클릭, 10초 간격
   - Windows 자동 절전 방지 + 사운드 알림 + fail-safe + Ctrl+C 종료
+  - DPI awareness 적용 (다중 모니터 / 배율 다를 때 좌표 정확성)
+  - autoclick_log.txt 로 모든 단계 자동 기록 (사후 진단)
 
 화면 꺼짐 동작:
   - 모니터 꺼짐 (디스플레이 절전): OK (ES_DISPLAY_REQUIRED 로 차단)
@@ -22,6 +24,8 @@
 """
 
 import argparse
+import datetime as dt
+import os
 import sys
 import threading
 import time
@@ -33,6 +37,38 @@ try:
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+
+def _set_dpi_awareness() -> None:
+    """Windows DPI awareness 활성화.
+
+    다중 모니터 + 모니터별 배율(100/125/150%)이 다를 때 pyautogui 좌표를
+    가상 화면 진짜 픽셀과 일치시킨다. 적용하지 않으면 OS 가 좌표를
+    시스템 배율로 자동 스케일링해 어긋남이 발생한다.
+
+    우선순위: Per-Monitor V2 (Win10 1703+) → Per-Monitor (8.1+) → System (Vista+)
+    """
+    if not sys.platform.startswith("win"):
+        return
+    import ctypes
+    try:
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(-4)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+_set_dpi_awareness()
+
 
 try:
     import pyautogui
@@ -56,6 +92,7 @@ WAIT_HOURS = 1
 WAIT_MINUTES = 45
 
 CLICK_INTERVAL_SEC = 10  # 클릭 간 간격 (초)
+HOVER_STABILIZATION_SEC = 0.3  # moveTo 후 click 직전 hover 대기 (앱 hover 인식)
 
 # (x, y) 좌표 리스트 — 순차 좌클릭
 COORDS = [
@@ -76,6 +113,46 @@ COORDS = [
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 ES_DISPLAY_REQUIRED = 0x00000002
+
+# Log file alongside the script (cwd-independent).
+LOG_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "autoclick_log.txt",
+)
+
+
+def emit(msg: str) -> None:
+    """콘솔 + 로그 파일에 메시지 기록."""
+    print(msg)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+    except Exception:
+        pass
+
+
+def init_log_session(args: argparse.Namespace) -> None:
+    """로그 파일에 새 실행 세션 헤더를 기록."""
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write("\n" + "=" * 56 + "\n")
+            f.write(f"=== Run started: {dt.datetime.now().isoformat()}\n")
+            flags = []
+            if args.dry_run:
+                flags.append("dry-run")
+            if args.quick:
+                flags.append("quick")
+            if args.keep_alive:
+                flags.append("keep-alive")
+            if flags:
+                f.write(f"=== Modes: {', '.join(flags)}\n")
+            try:
+                f.write(f"=== pyautogui size={pyautogui.size()}, position={pyautogui.position()}\n")
+            except Exception:
+                pass
+            f.write("=" * 56 + "\n")
+    except Exception:
+        pass
 
 
 def prevent_sleep(enable: bool) -> None:
@@ -122,7 +199,6 @@ def countdown(total_seconds: int, stop_event: threading.Event | None = None) -> 
     deadline = time.monotonic() + total_seconds
     last_minute_bucket = -1
 
-    # Phase 1: per-minute updates while >10s remain.
     while True:
         if stop_event is not None and stop_event.is_set():
             return False
@@ -131,19 +207,18 @@ def countdown(total_seconds: int, stop_event: threading.Event | None = None) -> 
             break
         bucket = int(remaining // 60)
         if bucket != last_minute_bucket:
-            print(f"[남은 시간] {fmt(remaining)}")
+            emit(f"[남은 시간] {fmt(remaining)}")
             last_minute_bucket = bucket
         time.sleep(min(1.0, max(0.0, remaining - 10)))
 
-    # Phase 2: final 10-second 1-second tick.
-    print("[클릭 직전] 마지막 10초 카운트다운")
+    emit("[클릭 직전] 마지막 10초 카운트다운")
     seconds_left = int(round(max(0.0, deadline - time.monotonic())))
     for s in range(seconds_left, 0, -1):
         if stop_event is not None and stop_event.is_set():
             return False
         if time.monotonic() >= deadline:
             break
-        print(f"  클릭까지 {s}초...")
+        emit(f"  클릭까지 {s}초...")
         target = deadline - (s - 1)
         delay = target - time.monotonic()
         if delay > 0:
@@ -152,37 +227,53 @@ def countdown(total_seconds: int, stop_event: threading.Event | None = None) -> 
 
 
 def perform_clicks(dry_run: bool = False, interval: float = CLICK_INTERVAL_SEC) -> None:
-    """COORDS 리스트를 순차 좌클릭. dry_run 시 print 만."""
+    """COORDS 리스트를 순차 좌클릭.
+
+    각 단계의 마우스 위치를 자세히 로그/기록:
+      - target:     의도한 좌표
+      - before:     이동 전 마우스 위치
+      - after_move: moveTo 결과 (어긋남 감지)
+      - delta:      target 과 after_move 차이 (DPI/스케일링 즉시 진단)
+      - after_click: 클릭 후 위치
+
+    moveTo 후 HOVER_STABILIZATION_SEC 대기 → click (일부 앱은 hover 후 click 필요).
+    """
     n = len(COORDS)
     for i, (x, y) in enumerate(COORDS, 1):
+        before = pyautogui.position()
         if dry_run:
-            print(f"[DRY-RUN {i}/{n}] would click ({x}, {y})  (no actual click)")
+            emit(f"[DRY-RUN {i}/{n}] target=({x},{y}) before=({before.x},{before.y})  (no actual click)")
         else:
-            print(f"[{i}/{n}] 좌표 ({x}, {y}) 이동 → 좌클릭")
+            emit(f"[{i}/{n}] target=({x},{y}) before=({before.x},{before.y})")
             pyautogui.moveTo(x, y, duration=0.5)
+            after_move = pyautogui.position()
+            dx = after_move.x - x
+            dy = after_move.y - y
+            if dx == 0 and dy == 0:
+                emit(f"   moved -> ({after_move.x},{after_move.y})  [OK 정확]")
+            else:
+                emit(f"   moved -> ({after_move.x},{after_move.y})  delta=({dx:+},{dy:+})  [WARN 어긋남]")
+            time.sleep(HOVER_STABILIZATION_SEC)
             pyautogui.click(x, y)
+            after_click = pyautogui.position()
+            emit(f"   clicked, after=({after_click.x},{after_click.y})")
         if i < n:
             if not dry_run:
-                print(f"  → 다음 클릭까지 {interval}초 대기")
+                emit(f"   -> 다음 클릭까지 {interval}초 대기")
             time.sleep(interval)
-    print(f"[완료] {n}개 좌표 {'시뮬' if dry_run else '클릭'} 처리됨")
+    emit(f"[완료] {n}개 좌표 {'시뮬' if dry_run else '클릭'} 처리됨")
 
 
 def keep_alive_worker(stop_event: threading.Event, period_sec: int = 300) -> None:
-    """주기적으로 마우스 1픽셀 이동 → idle 타이머 리셋 (Windows 자동 잠금 방지).
-
-    Fail-safe 코너 근처에서는 skip.
-    """
+    """주기적으로 마우스 1픽셀 이동 → idle 타이머 리셋 (Windows 자동 잠금 방지)."""
     while not stop_event.wait(period_sec):
         try:
             x, y = pyautogui.position()
-            # Skip if near top-left corner (fail-safe boundary).
             if x < 10 or y < 10:
-                continue
+                continue  # avoid fail-safe boundary
             pyautogui.moveTo(x - 1, y, duration=0.05)
             pyautogui.moveTo(x, y, duration=0.05)
         except pyautogui.FailSafeException:
-            # Don't crash keep-alive on fail-safe; just skip this round.
             pass
         except Exception:
             pass
@@ -212,6 +303,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    init_log_session(args)
 
     if args.quick:
         total = 5
@@ -221,8 +313,8 @@ def main() -> None:
         interval = CLICK_INTERVAL_SEC
 
     # Header.
-    print("=" * 56)
-    print("  AutoClicker — 다중 좌표 예약 클릭")
+    emit("=" * 56)
+    emit("  AutoClicker - 다중 좌표 예약 클릭")
     flags = []
     if args.dry_run:
         flags.append("DRY-RUN")
@@ -231,25 +323,29 @@ def main() -> None:
     if args.keep_alive:
         flags.append("KEEP-ALIVE")
     if flags:
-        print(f"  ** MODE: {' + '.join(flags)} **")
-    print("=" * 56)
-    print(f"  대기 시간:  {fmt(total)}  ({total}초)")
-    print(f"  좌표:       {len(COORDS)}개  ({interval}초 간격, 좌클릭)")
+        emit(f"  ** MODE: {' + '.join(flags)} **")
+    emit("=" * 56)
+    emit(f"  대기 시간:  {fmt(total)}  ({total}초)")
+    emit(f"  좌표:       {len(COORDS)}개  ({interval}초 간격, 좌클릭, hover 안정화 {HOVER_STABILIZATION_SEC}초)")
     for i, (x, y) in enumerate(COORDS, 1):
-        print(f"    {i}번: ({x:>5}, {y:>4})")
-    print()
-    print("  [안전] 마우스를 화면 모서리(좌상단) 이동 시 즉시 중단 (fail-safe)")
-    print("  [안전] Ctrl+C 로 언제든 종료")
+        emit(f"    {i}번: ({x:>5}, {y:>4})")
+    emit("")
+    try:
+        emit(f"  [Env] pyautogui size={pyautogui.size()}, position={pyautogui.position()}")
+    except Exception:
+        pass
+    emit(f"  [Log] {LOG_FILE}")
+    emit(f"  [안전] 마우스 -> 화면 모서리(좌상단) 이동 시 즉시 중단 (fail-safe)")
+    emit(f"  [안전] Ctrl+C 로 언제든 종료")
     if IS_WINDOWS and not args.dry_run:
-        print("  [옵션] Windows 자동 절전/디스플레이 꺼짐 방지 활성화")
+        emit(f"  [옵션] Windows 자동 절전/디스플레이 꺼짐 방지 활성화")
     if args.keep_alive:
-        print("  [옵션] Keep-alive: 5분마다 마우스 1픽셀 이동 (자동 잠금 방지)")
-    print("=" * 56)
-    print()
+        emit(f"  [옵션] Keep-alive: 5분마다 마우스 1픽셀 이동 (자동 잠금 방지)")
+    emit("=" * 56)
+    emit("")
 
     stop_event = threading.Event()
 
-    # Start keep-alive thread (only when needed and not dry-run).
     if args.keep_alive and not args.dry_run:
         threading.Thread(
             target=keep_alive_worker, args=(stop_event,), daemon=True
@@ -259,24 +355,23 @@ def main() -> None:
         prevent_sleep(True)
     try:
         if not countdown(total, stop_event):
-            print("[중단] 카운트다운 중 취소")
+            emit("[중단] 카운트다운 중 취소")
             return
         if not args.dry_run:
-            beep(1000, 200)  # click-imminent alert
+            beep(1000, 200)
 
-        # Stop keep-alive before clicks (avoid race with target clicks).
-        stop_event.set()
+        stop_event.set()  # stop keep-alive before clicks (avoid race)
 
         perform_clicks(dry_run=args.dry_run, interval=interval)
 
         if not args.dry_run:
-            beep(1500, 300)  # done alert
+            beep(1500, 300)
     except pyautogui.FailSafeException:
-        print("\n[중단] fail-safe 트리거 (마우스가 화면 모서리에 도달)")
+        emit("\n[중단] fail-safe 트리거 (마우스가 화면 모서리에 도달)")
     except KeyboardInterrupt:
-        print("\n[중단] 사용자가 Ctrl+C 로 종료")
+        emit("\n[중단] 사용자가 Ctrl+C 로 종료")
     except Exception as e:
-        print(f"\n[오류] {type(e).__name__}: {e}")
+        emit(f"\n[오류] {type(e).__name__}: {e}")
     finally:
         stop_event.set()
         if not args.dry_run:
