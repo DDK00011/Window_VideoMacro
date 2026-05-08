@@ -242,12 +242,18 @@ AutoClicker/
 ├── Docs/
 │   └── Dev_Plan.md       # 개발 계획서
 ├── main.py                       # 콘솔 진입점
-├── gui.py                        # GUI 진입점 (Tkinter, 추가 의존성 없음)
-├── install.bat                   # 의존성 설치 더블클릭 (Windows, 첫 실행 시)
-├── run_gui.bat                   # GUI 더블클릭 런처 (Windows)
-├── run_console.bat               # 콘솔 더블클릭 런처 (Windows)
-├── autoclicker_profile.json      # GUI 설정 (자동 생성, 시작 시 자동 적용)
-├── requirements.txt              # 의존성 (pyautogui)
+├── gui.py                        # GUI 진입점 (Tkinter)
+├── schedule_multi_click.py       # 다중 좌표 1회용 스크립트 (--dry-run/--quick/--keep-alive)
+├── install.bat                   # 의존성 설치 더블클릭 (첫 실행 시)
+├── run_gui.bat                   # GUI 더블클릭 런처
+├── run_console.bat               # 콘솔 더블클릭 런처
+├── run_scheduled.bat             # 다중 좌표 스크립트 런처
+├── test_scheduled.bat            # 다중 좌표 스크립트 스모크 테스트 (--dry-run --quick)
+├── build.bat                     # PyInstaller EXE 빌드 더블클릭
+├── autoclicker_profile.json      # GUI 설정 (자동 생성, 자동 적용)
+├── autoclick_log.txt             # 다중 좌표 스크립트 실행 로그 (자동 생성)
+├── requirements.txt              # 런타임 의존성 (pyautogui, Pillow)
+├── requirements-dev.txt          # 빌드 의존성 (+ pyinstaller)
 └── README.md             # 본 파일
 ```
 
@@ -255,14 +261,20 @@ AutoClicker/
 
 ## EXE 단일 파일 빌드 (배포용, 선택)
 
-Python 미설치 PC에 배포하고 싶다면 [PyInstaller](https://pyinstaller.org/)로 단일 EXE 생성 가능:
+Python 미설치 PC에 배포하고 싶다면 [PyInstaller](https://pyinstaller.org/)로 단일 EXE 생성 가능.
 
+### 가장 쉬운 방법: `build.bat` 더블클릭
+- pyinstaller 자동 설치 (없을 시)
+- 이전 build/dist 정리
+- `dist\AutoClicker.exe` 생성
+
+### 또는 수동 빌드
 ```
-pip install pyinstaller
+pip install -r requirements-dev.txt
 pyinstaller --noconfirm --onefile --windowed --name AutoClicker gui.py
 ```
 
-빌드 후 `dist/AutoClicker.exe` 가 생성됩니다 — 더블클릭으로 실행 가능.
+빌드 결과: `dist\AutoClicker.exe` (단일 파일, 더블클릭 실행 가능).
 
 > 일부 백신이 PyInstaller 단일 EXE를 의심할 수 있습니다 (잘 알려진 false positive). 배포 시에는 코드 서명을 적용하거나 신뢰된 PC에서만 사용하세요.
 

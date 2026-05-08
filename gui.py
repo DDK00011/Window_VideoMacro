@@ -57,9 +57,10 @@ except ImportError:
     sys.exit(1)
 
 # Optional dependency detection — find_spec avoids actual import,
-# so static analyzers won't flag unused/missing-module errors for cv2.
+# so static analyzers won't flag unused/missing-module errors.
 HAS_PILLOW = find_spec("PIL") is not None
 HAS_CV2 = find_spec("cv2") is not None
+HAS_KEYBOARD = find_spec("keyboard") is not None
 
 try:
     import winsound  # type: ignore
@@ -145,6 +146,8 @@ class AutoClickerApp:
         self.worker_thread: threading.Thread | None = None
         self._sleep_block_active = False
         self.multi_coords: list[tuple[int, int]] = []
+        self._keyboard_module = None
+        self._global_hotkeys_active = False
 
         self._build_ui()
         self._show_intro()
@@ -266,6 +269,17 @@ class AutoClickerApp:
         cv2_note = "  (0.7~1.0, opencv-python 권장)" if HAS_CV2 else "  (opencv 미설치 — 정확 매칭만 가능)"
         ttk.Label(conf_row, text=cv2_note).pack(side="left")
 
+        retry_row = ttk.Frame(self.image_frame)
+        retry_row.pack(fill="x", padx=4, pady=2)
+        self.image_retry_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            retry_row, text="찾을 때까지 재시도",
+            variable=self.image_retry_var,
+        ).pack(side="left")
+        ttk.Label(retry_row, text="  최대 시간(초):").pack(side="left")
+        self.image_retry_timeout_var = tk.StringVar(value="30")
+        ttk.Entry(retry_row, textvariable=self.image_retry_timeout_var, width=6).pack(side="left", padx=4)
+
         ttk.Button(
             self.image_frame, text="지금 화면에서 검색 (테스트)",
             command=self.image_test_search,
@@ -353,6 +367,16 @@ class AutoClickerApp:
             opt_frame, text="사운드 알림 (시작 직전 / 완료 시 beep)",
             variable=self.sound_var,
         ).pack(anchor="w", padx=4)
+        self.global_hotkey_var = tk.BooleanVar(value=False)
+        cb_hotkey = ttk.Checkbutton(
+            opt_frame,
+            text="글로벌 핫키 (창 포커스 없어도 F8/Esc/Ctrl+Enter)",
+            variable=self.global_hotkey_var,
+            command=self._toggle_global_hotkey,
+        )
+        cb_hotkey.pack(anchor="w", padx=4)
+        if not HAS_KEYBOARD:
+            cb_hotkey.state(["disabled"])
 
         # --- Action buttons ---
         btn_frame = ttk.Frame(self.root)
@@ -402,6 +426,8 @@ class AutoClickerApp:
             self._log("[안내] Pillow 미설치 — 이미지 검색 모드 사용 불가. pip install Pillow")
         if not HAS_CV2:
             self._log("[안내] opencv-python 미설치 — 이미지 검색은 정확 매칭만 가능 (confidence 무시).")
+        if not HAS_KEYBOARD:
+            self._log("[안내] keyboard 미설치 — 글로벌 핫키 사용 불가. pip install keyboard (Windows 관리자 권한 권장)")
         self._log("")
 
     def on_close(self) -> None:
@@ -410,7 +436,52 @@ class AutoClickerApp:
                 return
             self.cancel_event.set()
         self._set_sleep_block(False)
+        self._unbind_global_hotkeys(silent=True)
         self.root.destroy()
+
+    def _toggle_global_hotkey(self) -> None:
+        """글로벌 핫키 체크박스 핸들러 — keyboard 라이브러리로 등록/해제."""
+        if self.global_hotkey_var.get():
+            if not HAS_KEYBOARD:
+                messagebox.showerror(
+                    "의존성 누락",
+                    "keyboard 라이브러리가 필요합니다.\n\npip install keyboard\n\n"
+                    "Windows 에서는 관리자 권한으로 실행해야 동작합니다.",
+                )
+                self.global_hotkey_var.set(False)
+                return
+            try:
+                if self._keyboard_module is None:
+                    import keyboard  # type: ignore[import-not-found]
+                    self._keyboard_module = keyboard
+                kb = self._keyboard_module
+                kb.add_hotkey("f8", lambda: self.root.after(0, self.capture_position))
+                kb.add_hotkey("esc", lambda: self.root.after(0, self.cancel))
+                kb.add_hotkey("ctrl+enter", lambda: self.root.after(0, self.start))
+                self._global_hotkeys_active = True
+                self._log("[글로벌 핫키] 활성화 (F8 캡처 / Esc 중단 / Ctrl+Enter 시작)")
+            except Exception as e:
+                messagebox.showerror(
+                    "핫키 등록 실패",
+                    f"{type(e).__name__}: {e}\n\n"
+                    "Windows 에서는 관리자 권한으로 실행해야 할 수 있습니다.",
+                )
+                self.global_hotkey_var.set(False)
+                self._global_hotkeys_active = False
+        else:
+            self._unbind_global_hotkeys(silent=False)
+
+    def _unbind_global_hotkeys(self, silent: bool = False) -> None:
+        """등록된 글로벌 핫키 모두 해제."""
+        if self._keyboard_module is None or not self._global_hotkeys_active:
+            return
+        try:
+            self._keyboard_module.unhook_all()
+        except Exception:
+            pass
+        self._global_hotkeys_active = False
+        if not silent:
+            self._log("[글로벌 핫키] 비활성화")
 
     def _log(self, msg: str) -> None:
         self.log_text.config(state="normal")
@@ -682,6 +753,13 @@ class AutoClickerApp:
             if count < 1:
                 count = 1
             single_count = count
+            try:
+                retry_timeout = float(self.image_retry_timeout_var.get())
+            except ValueError:
+                messagebox.showerror("입력 오류", "재시도 최대 시간은 숫자여야 합니다.")
+                return None
+            if retry_timeout < 0:
+                retry_timeout = 0.0
 
         # Schedule.
         sched_mode = self.schedule_mode.get()
@@ -724,6 +802,12 @@ class AutoClickerApp:
             "click_type": self.click_type.get(),
             "image_path": image_path,
             "confidence": confidence,
+            "image_retry": (mode == "image" and self.image_retry_var.get()),
+            "image_retry_timeout": (
+                float(self.image_retry_timeout_var.get())
+                if mode == "image" and self.image_retry_timeout_var.get().strip()
+                else 30.0
+            ),
         }
 
     # =========================================================
@@ -899,16 +983,24 @@ class AutoClickerApp:
         else:  # image
             path = p["image_path"]
             confidence = p["confidence"]
-            self._ui(self._log, f"[이미지 모드 시작] {path}  count={count}  confidence={confidence}")
+            retry_until_found = p.get("image_retry", False)
+            retry_timeout = p.get("image_retry_timeout", 30.0)
+            mode_desc = (
+                f"retry until found ({retry_timeout:.0f}s)"
+                if retry_until_found else "single attempt"
+            )
+            self._ui(self._log, f"[이미지 모드 시작] {path}  count={count}  conf={confidence}  {mode_desc}")
             for i in range(1, count + 1):
                 if self.cancel_event.is_set():
                     self._ui(self._log, f"[중단] {i - 1}/{count} 후 중단")
                     self._ui(self._set_status, "중단됨")
                     return
                 self._ui(self._set_status, f"이미지 검색 {i}/{count}...")
-                pos = find_image_on_screen(path, confidence)
+                pos = self._find_image_with_retry(
+                    path, confidence, retry_until_found, retry_timeout, i, count,
+                )
                 if pos is None:
-                    self._ui(self._log, f"[{i}/{count}] 이미지 매칭 실패 — skip")
+                    self._ui(self._log, f"[{i}/{count}] 이미지 매칭 실패 -> skip")
                     if i < count:
                         time.sleep(interval)
                     continue
@@ -920,6 +1012,33 @@ class AutoClickerApp:
                 if i < count:
                     time.sleep(interval)
             self._ui(self._log, f"[완료] 이미지 모드 {count}회 시도 완료")
+
+    def _find_image_with_retry(
+        self, path: str, confidence: float,
+        retry_until_found: bool, retry_timeout: float,
+        idx: int = 0, total: int = 0,
+    ):
+        """이미지 검색. retry_until_found=True 면 timeout 까지 0.5초 간격 재시도."""
+        if not retry_until_found:
+            return find_image_on_screen(path, confidence)
+        deadline = time.monotonic() + retry_timeout
+        last_log = 0.0
+        while not self.cancel_event.is_set():
+            pos = find_image_on_screen(path, confidence)
+            if pos is not None:
+                return pos
+            now = time.monotonic()
+            if now >= deadline:
+                return None
+            if now - last_log >= 5:
+                elapsed = retry_timeout - (deadline - now)
+                self._ui(
+                    self._log,
+                    f"[{idx}/{total}] 매칭 검색 중... ({elapsed:.0f}/{retry_timeout:.0f}초)",
+                )
+                last_log = now
+            time.sleep(0.5)
+        return None
 
     @staticmethod
     def _click_at(x: int, y: int, click_type: str) -> None:
@@ -989,6 +1108,8 @@ class AutoClickerApp:
             "multi_coords": list(self.multi_coords),
             "image_path": self.image_path_var.get(),
             "confidence": self.confidence_var.get(),
+            "image_retry": self.image_retry_var.get(),
+            "image_retry_timeout": self.image_retry_timeout_var.get(),
             "schedule_mode": self.schedule_mode.get(),
             "hours": self.hours_var.get(),
             "minutes": self.minutes_var.get(),
@@ -999,6 +1120,7 @@ class AutoClickerApp:
             "interval": self.interval_var.get(),
             "prevent_sleep": self.prevent_sleep_var.get(),
             "sound": self.sound_var.get(),
+            "global_hotkey": self.global_hotkey_var.get(),
         }
 
     def _apply_profile(self, p: dict) -> None:
@@ -1013,6 +1135,8 @@ class AutoClickerApp:
         self._refresh_multi_listbox()
         self.image_path_var.set(p.get("image_path", ""))
         self.confidence_var.set(str(p.get("confidence", "0.9")))
+        self.image_retry_var.set(bool(p.get("image_retry", False)))
+        self.image_retry_timeout_var.set(str(p.get("image_retry_timeout", "30")))
         self.schedule_mode.set(p.get("schedule_mode", "relative"))
         self.hours_var.set(str(p.get("hours", "2")))
         self.minutes_var.set(str(p.get("minutes", "0")))
@@ -1023,6 +1147,12 @@ class AutoClickerApp:
         self.interval_var.set(str(p.get("interval", "0.2")))
         self.prevent_sleep_var.set(bool(p.get("prevent_sleep", IS_WINDOWS)))
         self.sound_var.set(bool(p.get("sound", True)))
+        # Restore global hotkey state if it was previously active.
+        want_hotkey = bool(p.get("global_hotkey", False)) and HAS_KEYBOARD
+        if want_hotkey != self.global_hotkey_var.get():
+            self.global_hotkey_var.set(want_hotkey)
+            if want_hotkey:
+                self._toggle_global_hotkey()
         self._on_coord_mode_change()
         self._on_schedule_mode_change()
 

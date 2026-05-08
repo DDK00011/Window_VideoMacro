@@ -41,6 +41,7 @@ autoclicker_profile.json
 *.spec
 build/
 dist/
+AutoClicker.spec
 
 # ====================================================
 # Logs / temp
