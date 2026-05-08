@@ -24,7 +24,7 @@ import threading
 import time
 import tkinter as tk
 from importlib.util import find_spec
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 
 
 def _set_dpi_awareness() -> None:
@@ -152,6 +152,7 @@ class AutoClickerApp:
         self._tray_icon = None
         self._tray_thread: threading.Thread | None = None
         self._tray_started = False
+        self.macro_actions: list[dict] = []
 
         self._build_ui()
         self._show_intro()
@@ -201,6 +202,11 @@ class AutoClickerApp:
         ttk.Radiobutton(
             mode_row, text="이미지 검색",
             variable=self.coord_mode, value="image",
+            command=self._on_coord_mode_change,
+        ).pack(side="left", padx=4)
+        ttk.Radiobutton(
+            mode_row, text="매크로",
+            variable=self.coord_mode, value="macro",
             command=self._on_coord_mode_change,
         ).pack(side="left", padx=4)
 
@@ -294,6 +300,51 @@ class AutoClickerApp:
             self.image_frame, textvariable=self.image_status_var,
             font=("Consolas", 10), foreground="#444",
         ).pack(fill="x", padx=4, pady=2)
+
+        # Macro mode frame
+        self.macro_frame = ttk.Frame(coord_frame)
+        macro_list_panel = ttk.Frame(self.macro_frame)
+        macro_list_panel.pack(side="left", fill="both", expand=True, padx=4, pady=4)
+        self.macro_tree = ttk.Treeview(
+            macro_list_panel, columns=("type", "params"),
+            show="tree headings", height=8,
+        )
+        self.macro_tree.heading("#0", text="#")
+        self.macro_tree.heading("type", text="타입")
+        self.macro_tree.heading("params", text="파라미터")
+        self.macro_tree.column("#0", width=35, anchor="center", stretch=False)
+        self.macro_tree.column("type", width=70, anchor="center", stretch=False)
+        self.macro_tree.column("params", width=200)
+        self.macro_tree.pack(side="left", fill="both", expand=True)
+        macro_scroll = ttk.Scrollbar(macro_list_panel, command=self.macro_tree.yview)
+        macro_scroll.pack(side="right", fill="y")
+        self.macro_tree["yscrollcommand"] = macro_scroll.set
+
+        macro_btn_panel = ttk.Frame(self.macro_frame)
+        macro_btn_panel.pack(side="left", fill="y", padx=4, pady=4)
+        ttk.Button(macro_btn_panel, text="좌클릭 추가", width=15,
+                   command=lambda: self.macro_add_click("left")).pack(fill="x", pady=2)
+        ttk.Button(macro_btn_panel, text="우클릭 추가", width=15,
+                   command=lambda: self.macro_add_click("right")).pack(fill="x", pady=2)
+        ttk.Button(macro_btn_panel, text="더블클릭 추가", width=15,
+                   command=lambda: self.macro_add_click("double")).pack(fill="x", pady=2)
+        ttk.Button(macro_btn_panel, text="드래그 추가", width=15,
+                   command=self.macro_add_drag).pack(fill="x", pady=2)
+        ttk.Button(macro_btn_panel, text="키 입력 추가", width=15,
+                   command=self.macro_add_key).pack(fill="x", pady=2)
+        ttk.Button(macro_btn_panel, text="텍스트 추가", width=15,
+                   command=self.macro_add_text).pack(fill="x", pady=2)
+        ttk.Button(macro_btn_panel, text="대기 추가", width=15,
+                   command=self.macro_add_wait).pack(fill="x", pady=2)
+        ttk.Separator(macro_btn_panel, orient="horizontal").pack(fill="x", pady=4)
+        ttk.Button(macro_btn_panel, text="선택 삭제", width=15,
+                   command=self.macro_remove).pack(fill="x", pady=2)
+        ttk.Button(macro_btn_panel, text="↑ 위로", width=15,
+                   command=lambda: self.macro_move(-1)).pack(fill="x", pady=2)
+        ttk.Button(macro_btn_panel, text="↓ 아래로", width=15,
+                   command=lambda: self.macro_move(+1)).pack(fill="x", pady=2)
+        ttk.Button(macro_btn_panel, text="전체 삭제", width=15,
+                   command=self.macro_clear).pack(fill="x", pady=2)
 
         # --- Schedule ---
         sched_frame = ttk.LabelFrame(self.root, text="시작 시점")
@@ -663,13 +714,16 @@ class AutoClickerApp:
         self.single_frame.pack_forget()
         self.multi_frame.pack_forget()
         self.image_frame.pack_forget()
+        self.macro_frame.pack_forget()
         mode = self.coord_mode.get()
         if mode == "single":
             self.single_frame.pack(fill="x", padx=4, pady=2)
         elif mode == "multi":
             self.multi_frame.pack(fill="both", expand=False, padx=4, pady=2)
-        else:
+        elif mode == "image":
             self.image_frame.pack(fill="x", padx=4, pady=2)
+        else:  # macro
+            self.macro_frame.pack(fill="both", expand=False, padx=4, pady=2)
 
     def _on_schedule_mode_change(self) -> None:
         mode = self.schedule_mode.get()
@@ -797,6 +851,167 @@ class AutoClickerApp:
             self._refresh_multi_listbox()
 
     # =========================================================
+    # Macro mode operations
+    # =========================================================
+
+    @staticmethod
+    def _action_params_str(action: dict) -> str:
+        t = action.get("type", "?")
+        if t == "click":
+            return f"({action.get('x')},{action.get('y')}) {action.get('click_type', 'left')}"
+        if t == "drag":
+            return (
+                f"({action.get('x1')},{action.get('y1')}) -> "
+                f"({action.get('x2')},{action.get('y2')}) {action.get('duration', 0.5)}s"
+            )
+        if t == "key":
+            return str(action.get("keys", ""))
+        if t == "text":
+            text = str(action.get("text", ""))
+            return text if len(text) <= 30 else text[:27] + "..."
+        if t == "wait":
+            return f"{action.get('seconds', 0)}초"
+        return ""
+
+    def _refresh_macro_tree(self) -> None:
+        for item in self.macro_tree.get_children():
+            self.macro_tree.delete(item)
+        for i, action in enumerate(self.macro_actions, 1):
+            self.macro_tree.insert("", "end", text=str(i), values=(
+                action.get("type", "?"), self._action_params_str(action),
+            ))
+
+    def _add_macro_action(self, action: dict) -> None:
+        self.macro_actions.append(action)
+        self._refresh_macro_tree()
+        self._log(f"[액션 추가] {action.get('type')}: {self._action_params_str(action)}")
+
+    def macro_add_click(self, click_type: str) -> None:
+        """3초 후 마우스 위치를 클릭 액션으로 매크로에 추가."""
+        if self.running:
+            return
+
+        def worker():
+            for i in range(3, 0, -1):
+                self._ui(self._set_status, f"{click_type} 클릭 위치: {i}초 후...")
+                time.sleep(1)
+            try:
+                x, y = pyautogui.position()
+            except Exception as e:
+                self._ui(self._log, f"[오류] 좌표 조회 실패: {e}")
+                return
+            self._ui(self._add_macro_action, {
+                "type": "click",
+                "x": int(x), "y": int(y),
+                "click_type": click_type,
+            })
+            self._ui(self._set_status, f"클릭 액션 추가: ({x}, {y})")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def macro_add_drag(self) -> None:
+        """3초 후 시작점, 다시 3초 후 끝점 캡처."""
+        if self.running:
+            return
+
+        def worker():
+            for i in range(3, 0, -1):
+                self._ui(self._set_status, f"드래그 시작점: {i}초 후...")
+                time.sleep(1)
+            try:
+                x1, y1 = pyautogui.position()
+            except Exception as e:
+                self._ui(self._log, f"[오류] {e}")
+                return
+            self._ui(self._set_status, f"시작점: ({x1}, {y1}) - 끝점으로 마우스 이동")
+            for i in range(3, 0, -1):
+                self._ui(self._set_status, f"드래그 끝점: {i}초 후...")
+                time.sleep(1)
+            try:
+                x2, y2 = pyautogui.position()
+            except Exception as e:
+                self._ui(self._log, f"[오류] {e}")
+                return
+            self._ui(self._add_macro_action, {
+                "type": "drag",
+                "x1": int(x1), "y1": int(y1),
+                "x2": int(x2), "y2": int(y2),
+                "duration": 0.5,
+            })
+            self._ui(self._set_status, f"드래그 액션 추가: ({x1},{y1}) -> ({x2},{y2})")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def macro_add_key(self) -> None:
+        if self.running:
+            return
+        keys = simpledialog.askstring(
+            "키 입력 추가",
+            "단축키 (예: ctrl+c, enter, f5, alt+tab):",
+            parent=self.root,
+        )
+        if keys and keys.strip():
+            self._add_macro_action({"type": "key", "keys": keys.strip()})
+
+    def macro_add_text(self) -> None:
+        if self.running:
+            return
+        text = simpledialog.askstring(
+            "텍스트 입력 추가",
+            "타이핑할 텍스트:",
+            parent=self.root,
+        )
+        if text is not None:
+            self._add_macro_action({"type": "text", "text": text})
+
+    def macro_add_wait(self) -> None:
+        if self.running:
+            return
+        seconds = simpledialog.askfloat(
+            "대기 추가",
+            "대기 시간(초):",
+            parent=self.root, minvalue=0.0,
+        )
+        if seconds is not None:
+            self._add_macro_action({"type": "wait", "seconds": float(seconds)})
+
+    def macro_remove(self) -> None:
+        sel = self.macro_tree.selection()
+        if not sel:
+            return
+        idx = self.macro_tree.index(sel[0])
+        del self.macro_actions[idx]
+        self._refresh_macro_tree()
+        children = self.macro_tree.get_children()
+        if children:
+            new_sel = min(idx, len(children) - 1)
+            self.macro_tree.selection_set(children[new_sel])
+
+    def macro_move(self, direction: int) -> None:
+        sel = self.macro_tree.selection()
+        if not sel:
+            return
+        idx = self.macro_tree.index(sel[0])
+        new_idx = idx + direction
+        if 0 <= new_idx < len(self.macro_actions):
+            self.macro_actions[idx], self.macro_actions[new_idx] = (
+                self.macro_actions[new_idx], self.macro_actions[idx],
+            )
+            self._refresh_macro_tree()
+            children = self.macro_tree.get_children()
+            if new_idx < len(children):
+                self.macro_tree.selection_set(children[new_idx])
+
+    def macro_clear(self) -> None:
+        if not self.macro_actions:
+            return
+        if messagebox.askyesno(
+            "확인", f"{len(self.macro_actions)}개 액션을 모두 삭제하시겠습니까?",
+        ):
+            self.macro_actions.clear()
+            self._refresh_macro_tree()
+
+    # =========================================================
     # Image mode operations
     # =========================================================
 
@@ -886,7 +1101,7 @@ class AutoClickerApp:
                 messagebox.showerror("입력 오류", "다중 좌표 모드는 최소 1개 좌표가 필요합니다.")
                 return None
             coords = list(self.multi_coords)
-        else:  # image
+        elif mode == "image":
             if not HAS_PILLOW:
                 messagebox.showerror("의존성 누락", "이미지 모드에는 Pillow 가 필요합니다.\npip install Pillow")
                 return None
@@ -919,6 +1134,12 @@ class AutoClickerApp:
                 return None
             if retry_timeout < 0:
                 retry_timeout = 0.0
+        else:  # macro
+            if not self.macro_actions:
+                messagebox.showerror("입력 오류", "매크로 모드는 최소 1개 액션이 필요합니다.")
+                return None
+            coords = []
+            single_count = 1
 
         # Schedule.
         sched_mode = self.schedule_mode.get()
@@ -994,6 +1215,7 @@ class AutoClickerApp:
                 if mode == "image" and self.image_retry_timeout_var.get().strip()
                 else 30.0
             ),
+            "macro_actions": list(self.macro_actions) if mode == "macro" else [],
         }
 
     # =========================================================
@@ -1040,11 +1262,13 @@ class AutoClickerApp:
             coord_summary = f"좌표: ({x}, {y})  ×  {params['count']}회"
         elif params["coord_mode"] == "multi":
             coord_summary = f"다중 좌표 {len(params['coords'])}개 순차"
-        else:
+        elif params["coord_mode"] == "image":
             coord_summary = (
                 f"이미지 검색: {os.path.basename(params['image_path'])}  ×  {params['count']}회"
                 f"  (confidence={params['confidence']})"
             )
+        else:  # macro
+            coord_summary = f"매크로 {len(params.get('macro_actions', []))}개 액션 순차"
 
         confirm_msg = (
             f"{coord_summary}\n"
@@ -1203,7 +1427,7 @@ class AutoClickerApp:
                     time.sleep(interval)
             self._ui(self._log, f"[완료] {n}개 좌표 클릭 처리됨")
 
-        else:  # image
+        elif p["coord_mode"] == "image":
             path = p["image_path"]
             confidence = p["confidence"]
             retry_until_found = p.get("image_retry", False)
@@ -1235,6 +1459,62 @@ class AutoClickerApp:
                 if i < count:
                     time.sleep(interval)
             self._ui(self._log, f"[완료] 이미지 모드 {count}회 시도 완료")
+
+        else:  # macro
+            self._do_macro(p)
+
+    def _do_macro(self, p: dict) -> None:
+        """매크로 액션 시퀀스를 순차 실행."""
+        actions = p.get("macro_actions", [])
+        interval = p["interval"]
+        n = len(actions)
+        self._ui(self._log, f"[매크로 시작] {n}개 액션 순차 실행")
+        for i, action in enumerate(actions, 1):
+            if self.cancel_event.is_set():
+                self._ui(self._log, f"[중단] {i - 1}/{n} 후 중단")
+                self._ui(self._set_status, "중단됨")
+                return
+            self._ui(self._set_status, f"액션 {i}/{n}: {action.get('type', '?')}")
+            self._execute_action(i, n, action)
+            if i < n:
+                time.sleep(interval)
+        self._ui(self._log, f"[완료] {n}개 액션 처리됨")
+
+    def _execute_action(self, i: int, n: int, action: dict) -> None:
+        """단일 액션 실행 — click / drag / key / text / wait."""
+        t = action.get("type", "?")
+        params_str = self._action_params_str(action)
+        self._ui(self._log, f"[{i}/{n}] {t}: {params_str}")
+        if t == "click":
+            x, y = int(action["x"]), int(action["y"])
+            ct = action.get("click_type", "left")
+            pyautogui.moveTo(x, y, duration=0.3)
+            time.sleep(HOVER_STABILIZATION_SEC)
+            self._click_at(x, y, ct)
+        elif t == "drag":
+            x1, y1 = int(action["x1"]), int(action["y1"])
+            x2, y2 = int(action["x2"]), int(action["y2"])
+            dur = float(action.get("duration", 0.5))
+            pyautogui.moveTo(x1, y1, duration=0.3)
+            time.sleep(HOVER_STABILIZATION_SEC)
+            pyautogui.dragTo(x2, y2, duration=dur, button="left")
+        elif t == "key":
+            keys = str(action.get("keys", ""))
+            parts = [k.strip().lower() for k in keys.split("+") if k.strip()]
+            if parts:
+                pyautogui.hotkey(*parts)
+        elif t == "text":
+            text = str(action.get("text", ""))
+            pyautogui.write(text, interval=0.02)
+        elif t == "wait":
+            secs = float(action.get("seconds", 0))
+            end = time.monotonic() + secs
+            while time.monotonic() < end:
+                if self.cancel_event.is_set():
+                    return
+                time.sleep(min(0.1, end - time.monotonic()))
+        else:
+            self._ui(self._log, f"[경고] 알 수 없는 액션 타입: {t!r} - skip")
 
     def _find_image_with_retry(
         self, path: str, confidence: float,
@@ -1348,6 +1628,7 @@ class AutoClickerApp:
             "interval_value": self.interval_value_var.get(),
             "interval_unit": self.interval_unit_var.get(),
             "max_iterations": self.max_iterations_var.get(),
+            "macro_actions": list(self.macro_actions),
         }
 
     def _apply_profile(self, p: dict) -> None:
@@ -1370,6 +1651,12 @@ class AutoClickerApp:
             unit = "minutes"
         self.interval_unit_var.set(unit)
         self.max_iterations_var.set(str(p.get("max_iterations", "0")))
+        loaded_macro = p.get("macro_actions", [])
+        try:
+            self.macro_actions = [dict(a) for a in loaded_macro if isinstance(a, dict)]
+        except Exception:
+            self.macro_actions = []
+        self._refresh_macro_tree()
         self.schedule_mode.set(p.get("schedule_mode", "relative"))
         self.hours_var.set(str(p.get("hours", "2")))
         self.minutes_var.set(str(p.get("minutes", "0")))
