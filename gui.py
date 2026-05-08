@@ -61,6 +61,7 @@ except ImportError:
 HAS_PILLOW = find_spec("PIL") is not None
 HAS_CV2 = find_spec("cv2") is not None
 HAS_KEYBOARD = find_spec("keyboard") is not None
+HAS_PYSTRAY = find_spec("pystray") is not None
 
 try:
     import winsound  # type: ignore
@@ -148,6 +149,9 @@ class AutoClickerApp:
         self.multi_coords: list[tuple[int, int]] = []
         self._keyboard_module = None
         self._global_hotkeys_active = False
+        self._tray_icon = None
+        self._tray_thread: threading.Thread | None = None
+        self._tray_started = False
 
         self._build_ui()
         self._show_intro()
@@ -328,6 +332,34 @@ class AutoClickerApp:
         self.abs_min_entry = ttk.Entry(abs_row, textvariable=self.abs_min_var, width=5)
         self.abs_min_entry.pack(side="left", padx=2)
 
+        int_row = ttk.Frame(sched_frame)
+        int_row.pack(fill="x", padx=4, pady=2)
+        ttk.Radiobutton(
+            int_row, text="반복",
+            variable=self.schedule_mode, value="interval",
+            command=self._on_schedule_mode_change,
+        ).pack(side="left")
+        ttk.Label(int_row, text="  간격:").pack(side="left")
+        self.interval_value_var = tk.StringVar(value="5")
+        self.interval_value_entry = ttk.Entry(
+            int_row, textvariable=self.interval_value_var, width=6,
+        )
+        self.interval_value_entry.pack(side="left", padx=2)
+        self.interval_unit_var = tk.StringVar(value="minutes")
+        self.interval_unit_combo = ttk.Combobox(
+            int_row, textvariable=self.interval_unit_var,
+            values=["seconds", "minutes", "hours"],
+            state="readonly", width=10,
+        )
+        self.interval_unit_combo.pack(side="left", padx=2)
+        ttk.Label(int_row, text="  최대 반복:").pack(side="left")
+        self.max_iterations_var = tk.StringVar(value="0")
+        self.max_iter_entry = ttk.Entry(
+            int_row, textvariable=self.max_iterations_var, width=5,
+        )
+        self.max_iter_entry.pack(side="left", padx=2)
+        ttk.Label(int_row, text="(0=무한)").pack(side="left")
+
         # --- Click setting ---
         click_frame = ttk.LabelFrame(self.root, text="클릭 설정")
         click_frame.pack(fill="x", **pad)
@@ -377,6 +409,16 @@ class AutoClickerApp:
         cb_hotkey.pack(anchor="w", padx=4)
         if not HAS_KEYBOARD:
             cb_hotkey.state(["disabled"])
+        self.use_tray_var = tk.BooleanVar(value=False)
+        cb_tray = ttk.Checkbutton(
+            opt_frame,
+            text="트레이 사용 (창 닫기 시 종료 대신 트레이로 최소화)",
+            variable=self.use_tray_var,
+            command=self._toggle_tray,
+        )
+        cb_tray.pack(anchor="w", padx=4)
+        if not (HAS_PYSTRAY and HAS_PILLOW):
+            cb_tray.state(["disabled"])
 
         # --- Action buttons ---
         btn_frame = ttk.Frame(self.root)
@@ -428,15 +470,24 @@ class AutoClickerApp:
             self._log("[안내] opencv-python 미설치 — 이미지 검색은 정확 매칭만 가능 (confidence 무시).")
         if not HAS_KEYBOARD:
             self._log("[안내] keyboard 미설치 — 글로벌 핫키 사용 불가. pip install keyboard (Windows 관리자 권한 권장)")
+        if not HAS_PYSTRAY:
+            self._log("[안내] pystray 미설치 — 트레이 모드 사용 불가. pip install pystray")
         self._log("")
 
     def on_close(self) -> None:
+        # Tray mode: hide instead of destroy.
+        if self.use_tray_var.get() and self._tray_started:
+            self.root.withdraw()
+            self._log("[트레이] 창 숨김 - 트레이 메뉴에서 '창 표시' 로 복원 가능")
+            return
+
         if self.running:
             if not messagebox.askyesno("확인", "예약 클릭이 진행 중입니다. 종료하시겠습니까?"):
                 return
             self.cancel_event.set()
         self._set_sleep_block(False)
         self._unbind_global_hotkeys(silent=True)
+        self._stop_tray()
         self.root.destroy()
 
     def _toggle_global_hotkey(self) -> None:
@@ -483,6 +534,105 @@ class AutoClickerApp:
         if not silent:
             self._log("[글로벌 핫키] 비활성화")
 
+    # =========================================================
+    # System tray (pystray)
+    # =========================================================
+
+    def _toggle_tray(self) -> None:
+        """트레이 사용 체크박스 핸들러."""
+        if self.use_tray_var.get():
+            if not (HAS_PYSTRAY and HAS_PILLOW):
+                messagebox.showerror(
+                    "의존성 누락",
+                    "트레이 사용에는 pystray + Pillow 가 필요합니다.\n\n"
+                    "pip install pystray Pillow",
+                )
+                self.use_tray_var.set(False)
+                return
+            if not self._tray_started:
+                self._start_tray()
+            if self._tray_started:
+                self._log("[트레이] 활성화 - 창 닫기 시 트레이로 최소화")
+        else:
+            # Keep the icon running but disable hide-on-close behavior.
+            self._log("[트레이] 비활성화 - 창 닫기 시 종료")
+
+    def _start_tray(self) -> None:
+        """pystray 아이콘을 백그라운드 스레드에서 시작."""
+        if self._tray_started:
+            return
+        try:
+            import pystray  # type: ignore[import-not-found]
+            from pystray import Menu, MenuItem  # type: ignore[import-not-found]
+            from PIL import Image, ImageDraw  # type: ignore
+        except Exception as e:
+            self._log(f"[트레이] import 실패: {e}")
+            self.use_tray_var.set(False)
+            return
+
+        # Generate a simple 64x64 icon: blue square with white "AC" mark.
+        img = Image.new("RGB", (64, 64), color="#2d6cdf")
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([6, 6, 58, 58], outline="white", width=3)
+        try:
+            draw.text((16, 18), "AC", fill="white")
+        except Exception:
+            pass
+
+        menu = Menu(
+            MenuItem("창 표시", self._tray_show, default=True),
+            MenuItem("예약 시작", self._tray_start_action),
+            MenuItem("중단", self._tray_cancel_action),
+            Menu.SEPARATOR,
+            MenuItem("종료", self._tray_exit),
+        )
+        try:
+            self._tray_icon = pystray.Icon("AutoClicker", img, "AutoClicker", menu)
+            self._tray_thread = threading.Thread(
+                target=self._tray_icon.run, daemon=True,
+            )
+            self._tray_thread.start()
+            self._tray_started = True
+        except Exception as e:
+            self._log(f"[트레이] 시작 실패: {e}")
+            self.use_tray_var.set(False)
+
+    def _stop_tray(self) -> None:
+        """트레이 아이콘 정리 (창 종료 시)."""
+        if self._tray_icon is None:
+            return
+        try:
+            self._tray_icon.stop()
+        except Exception:
+            pass
+        self._tray_icon = None
+        self._tray_started = False
+
+    # Tray menu callbacks (run on pystray thread; bridge to main thread).
+    def _tray_show(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self._restore_window)
+
+    def _restore_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _tray_start_action(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self.start)
+
+    def _tray_cancel_action(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self.cancel)
+
+    def _tray_exit(self, _icon=None, _item=None) -> None:
+        # Force exit from tray menu — bypass tray-hide behavior.
+        def _do_exit():
+            self.use_tray_var.set(False)
+            self._set_sleep_block(False)
+            self._unbind_global_hotkeys(silent=True)
+            self._stop_tray()
+            self.root.destroy()
+        self.root.after(0, _do_exit)
+
     def _log(self, msg: str) -> None:
         self.log_text.config(state="normal")
         self.log_text.insert("end", msg + "\n")
@@ -522,16 +672,25 @@ class AutoClickerApp:
             self.image_frame.pack(fill="x", padx=4, pady=2)
 
     def _on_schedule_mode_change(self) -> None:
-        if self.schedule_mode.get() == "relative":
+        mode = self.schedule_mode.get()
+        # All disabled by default, then enable per mode.
+        for w in (
+            self.hours_entry, self.minutes_entry,
+            self.abs_hour_entry, self.abs_min_entry,
+            self.interval_value_entry, self.max_iter_entry,
+        ):
+            w.config(state="disabled")
+        self.interval_unit_combo.config(state="disabled")
+        if mode == "relative":
             self.hours_entry.config(state="normal")
             self.minutes_entry.config(state="normal")
-            self.abs_hour_entry.config(state="disabled")
-            self.abs_min_entry.config(state="disabled")
-        else:
-            self.hours_entry.config(state="disabled")
-            self.minutes_entry.config(state="disabled")
+        elif mode == "absolute":
             self.abs_hour_entry.config(state="normal")
             self.abs_min_entry.config(state="normal")
+        else:  # interval
+            self.interval_value_entry.config(state="normal")
+            self.interval_unit_combo.config(state="readonly")
+            self.max_iter_entry.config(state="normal")
 
     def _set_sleep_block(self, enable: bool) -> None:
         if enable == self._sleep_block_active:
@@ -763,6 +922,8 @@ class AutoClickerApp:
 
         # Schedule.
         sched_mode = self.schedule_mode.get()
+        interval_sec = 0
+        max_iterations = 0
         if sched_mode == "relative":
             try:
                 hours = int(self.hours_var.get())
@@ -775,7 +936,7 @@ class AutoClickerApp:
                 return None
             total = hours * 3600 + minutes * 60
             schedule_label = f"지금부터 {hours}시간 {minutes}분 뒤"
-        else:
+        elif sched_mode == "absolute":
             try:
                 ah = int(self.abs_hour_var.get())
                 am = int(self.abs_min_var.get())
@@ -791,6 +952,28 @@ class AutoClickerApp:
                 target += dt.timedelta(days=1)
             total = int((target - now).total_seconds())
             schedule_label = f"{target.strftime('%Y-%m-%d %H:%M')} (약 {self._fmt(total)} 후)"
+        else:  # interval
+            try:
+                interval_value = float(self.interval_value_var.get())
+            except ValueError:
+                messagebox.showerror("입력 오류", "반복 간격 값은 숫자여야 합니다.")
+                return None
+            if interval_value <= 0:
+                messagebox.showerror("입력 오류", "반복 간격 값은 0보다 커야 합니다.")
+                return None
+            unit = self.interval_unit_var.get()
+            multiplier = {"seconds": 1, "minutes": 60, "hours": 3600}.get(unit, 60)
+            interval_sec = max(1, int(interval_value * multiplier))
+            try:
+                max_iterations = int(self.max_iterations_var.get())
+            except ValueError:
+                messagebox.showerror("입력 오류", "최대 반복 횟수는 정수여야 합니다.")
+                return None
+            if max_iterations < 0:
+                max_iterations = 0
+            total = interval_sec  # first wait until first execution
+            limit_label = f"최대 {max_iterations}회" if max_iterations > 0 else "무한 반복"
+            schedule_label = f"매 {interval_value}{unit} 마다 ({limit_label})"
 
         return {
             "coord_mode": mode,
@@ -799,6 +982,9 @@ class AutoClickerApp:
             "interval": interval,
             "total": total,
             "schedule_label": schedule_label,
+            "schedule_mode": sched_mode,
+            "interval_sec": interval_sec,
+            "max_iterations": max_iterations,
             "click_type": self.click_type.get(),
             "image_path": image_path,
             "confidence": confidence,
@@ -899,25 +1085,10 @@ class AutoClickerApp:
 
     def _run_schedule(self, p: dict) -> None:
         try:
-            ok = self._countdown(p["total"])
-            if not ok:
-                self._ui(self._log, "[중단] 카운트다운 중 취소")
-                self._ui(self._set_status, "중단됨")
-                self._ui(self._set_progress, 0)
-                return
-
-            if self.sound_var.get():
-                beep(1000, 200)
-
-            self._do_clicks(p)
-            if self.cancel_event.is_set():
-                return
-
-            if self.sound_var.get():
-                beep(1500, 300)
-
-            self._ui(self._set_progress, 100)
-            self._ui(self._set_status, "완료")
+            if p.get("schedule_mode") == "interval":
+                self._run_interval(p)
+            else:
+                self._run_one_shot(p)
         except pyautogui.FailSafeException:
             self._ui(self._log, "[중단] fail-safe 트리거 (마우스가 화면 모서리)")
             self._ui(self._set_status, "fail-safe 중단")
@@ -930,6 +1101,58 @@ class AutoClickerApp:
                 self._ui(self._set_sleep_block, False)
             self._ui(self.start_btn.config, state="normal")
             self._ui(self.cancel_btn.config, state="disabled")
+
+    def _run_one_shot(self, p: dict) -> None:
+        """1회 실행 (relative / absolute schedule)."""
+        ok = self._countdown(p["total"])
+        if not ok:
+            self._ui(self._log, "[중단] 카운트다운 중 취소")
+            self._ui(self._set_status, "중단됨")
+            self._ui(self._set_progress, 0)
+            return
+
+        if self.sound_var.get():
+            beep(1000, 200)
+
+        self._do_clicks(p)
+        if self.cancel_event.is_set():
+            return
+
+        if self.sound_var.get():
+            beep(1500, 300)
+
+        self._ui(self._set_progress, 100)
+        self._ui(self._set_status, "완료")
+
+    def _run_interval(self, p: dict) -> None:
+        """반복 모드 — 매 interval_sec 마다 click 사이클 실행."""
+        interval_sec = p["interval_sec"]
+        max_iter = p.get("max_iterations", 0)
+        iterations = 0
+        limit_str = str(max_iter) if max_iter > 0 else "무한"
+        self._ui(self._log, f"[반복 모드] 매 {interval_sec}초 마다, 최대 {limit_str} 회")
+        while not self.cancel_event.is_set():
+            ok = self._countdown(interval_sec)
+            if not ok:
+                self._ui(self._log, f"[중단] 반복 #{iterations + 1} 대기 중 취소")
+                self._ui(self._set_status, "중단됨")
+                return
+            if self.sound_var.get():
+                beep(1000, 200)
+            self._do_clicks(p)
+            if self.cancel_event.is_set():
+                return
+            iterations += 1
+            self._ui(self._log, f"[반복 {iterations}/{limit_str}] 사이클 완료")
+            self._ui(self._set_status, f"반복 {iterations}/{limit_str} 완료, 다음 사이클 대기")
+            if max_iter > 0 and iterations >= max_iter:
+                if self.sound_var.get():
+                    beep(1500, 300)
+                self._ui(self._set_progress, 100)
+                self._ui(self._set_status, f"반복 완료 ({iterations}회)")
+                self._ui(self._log, f"[전체 완료] {iterations}회 반복 수행")
+                return
+            self._ui(self._set_progress, 0)  # reset for next cycle
 
     def _do_clicks(self, p: dict) -> None:
         click_type = p["click_type"]
@@ -1121,6 +1344,10 @@ class AutoClickerApp:
             "prevent_sleep": self.prevent_sleep_var.get(),
             "sound": self.sound_var.get(),
             "global_hotkey": self.global_hotkey_var.get(),
+            "use_tray": self.use_tray_var.get(),
+            "interval_value": self.interval_value_var.get(),
+            "interval_unit": self.interval_unit_var.get(),
+            "max_iterations": self.max_iterations_var.get(),
         }
 
     def _apply_profile(self, p: dict) -> None:
@@ -1137,6 +1364,12 @@ class AutoClickerApp:
         self.confidence_var.set(str(p.get("confidence", "0.9")))
         self.image_retry_var.set(bool(p.get("image_retry", False)))
         self.image_retry_timeout_var.set(str(p.get("image_retry_timeout", "30")))
+        self.interval_value_var.set(str(p.get("interval_value", "5")))
+        unit = p.get("interval_unit", "minutes")
+        if unit not in ("seconds", "minutes", "hours"):
+            unit = "minutes"
+        self.interval_unit_var.set(unit)
+        self.max_iterations_var.set(str(p.get("max_iterations", "0")))
         self.schedule_mode.set(p.get("schedule_mode", "relative"))
         self.hours_var.set(str(p.get("hours", "2")))
         self.minutes_var.set(str(p.get("minutes", "0")))
@@ -1153,6 +1386,12 @@ class AutoClickerApp:
             self.global_hotkey_var.set(want_hotkey)
             if want_hotkey:
                 self._toggle_global_hotkey()
+        # Restore tray state.
+        want_tray = bool(p.get("use_tray", False)) and HAS_PYSTRAY and HAS_PILLOW
+        if want_tray != self.use_tray_var.get():
+            self.use_tray_var.set(want_tray)
+            if want_tray:
+                self._toggle_tray()
         self._on_coord_mode_change()
         self._on_schedule_mode_change()
 
